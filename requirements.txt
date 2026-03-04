@@ -1,0 +1,18 @@
+# LLM & AI
+langchain-text-splitters==0.3.4
+langgraph==0.2.60
+
+# AWS
+boto3==1.35.86
+
+# Vector DB
+pinecone-client==5.0.1
+
+# UI
+streamlit==1.41.1
+
+# Utilities
+python-dotenv==1.0.1
+
+# Testing
+pytest==8.3.4
