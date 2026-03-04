@@ -43,13 +43,28 @@ The system orchestrates **six specialized AI agents** through a LangGraph pipeli
 AWS CloudTrail records every API call made in an AWS account — who did what, when, from which IP, on which resource. On a typical active account, this generates hundreds to thousands of events per day across dozens of event types. When a security team needs to answer a question like *"Were there any unauthorized IAM changes last night?"*, the raw answer is buried in compressed JSON files spread across S3 folders, each event containing 50+ fields of AWS internals.
 
 Traditionally, answering this question requires:
-1. Querying CloudTrail or Athena
-2. Writing filter expressions in an unfamiliar query syntax
-3. Interpreting raw JSON event fields
-4. Manually cross-referencing AWS documentation to understand risk
-5. Writing a report manually
 
-This process takes hours, requires technical expertise, and is error-prone. It is also reactive — it only happens after someone manually decides to investigate.
+**1. Querying CloudTrail or Athena**
+CloudTrail has a built-in search tool, but it is limited — basic filters only, 90-day history cap. For anything deeper, you need AWS Athena: a SQL query service that can search the raw log files in S3. This requires knowing SQL, knowing the exact table and column names AWS uses, and setting it up in advance. A non-technical person cannot do this.
+
+**2. Writing filter expressions in an unfamiliar query syntax**
+Even with SQL knowledge, CloudTrail's JSON structure is deeply nested. Filtering by username alone looks like:
+```sql
+WHERE json_extract(useridentity, '$.userName') = 'docugen-dev'
+AND eventtime > '2026-02-07T00:00:00Z'
+```
+One wrong field name returns zero results with no explanation why.
+
+**3. Interpreting raw JSON event fields**
+Even after getting results, you are staring at raw JSON — 50+ fields per event, most of them irrelevant noise (`tlsDetails`, `requestID`, `principalId`, `eventVersion`, etc.). A non-technical person has no idea what matters and what to ignore.
+
+**4. Manually cross-referencing AWS documentation to understand risk**
+Say you see the event `AttachUserPolicy` — is that dangerous? You would need to open AWS documentation, look it up, understand what it does, and assess whether the specific policy attached represents a risk. That is extra time just to understand what you are looking at.
+
+**5. Writing a report manually**
+After all of that, you still have to write the report yourself — format it, assess the risk level, list recommendations. More hours of work.
+
+This process takes hours, requires technical expertise, and is error-prone. It is also **reactive** — nobody goes through this pain unless something already went wrong: an alert fired, a breach was discovered, or a compliance audit demanded evidence. There is no proactive daily monitoring because the manual process is too costly.
 
 ### The Solution: Natural Language → Audit Report
 
