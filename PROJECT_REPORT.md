@@ -76,7 +76,29 @@ A report that says "user X created an IAM role" is a log dump. A report that say
 
 ### Why Audit-Ready Output Matters
 
-Security teams operate under compliance frameworks (SOC 2, ISO 27001, PCI-DSS) that require documented evidence of security monitoring. A time-stamped, structured Markdown report stored in S3 with traceable metadata (which model was used, what confidence score was achieved, which documentation sources were referenced) is directly usable as audit evidence. This is not a chatbot — it is a documentation system.
+SOC 2, ISO 27001, and PCI-DSS are official security standards that companies must comply with — especially if they handle sensitive data or work with enterprise clients. Think of them as certifications that prove "this company takes security seriously." To get and maintain these certifications, companies must **prove** they are actively monitoring their systems. An auditor comes in and asks: *"Show me evidence that you monitored your AWS account last month."*
+
+Not just "yes we monitored it" — they need an actual document with a timestamp, what was analyzed, what was found, and what actions were recommended.
+
+Every report DocuGen generates is automatically saved to S3 with two files:
+
+**The report itself** — a structured Markdown document with a timeline of events, findings, risk assessment, and recommendations.
+
+**A metadata file** — a JSON file stored alongside it containing:
+```json
+{
+  "generated_at": "2026-02-08T15:30:00Z",
+  "query": "What IAM changes happened yesterday?",
+  "model_used": "Claude 3.5 Sonnet",
+  "retrieval_confidence": 0.72,
+  "sources_referenced": ["iam-best-practices.md", "iam-users-guide.md"],
+  "event_count": 42
+}
+```
+
+An auditor can open this and verify: when the report was generated, what data was analyzed, which documentation backed the recommendations, and how confident the AI was. Everything is traceable.
+
+**This is not a chatbot — it is a documentation system.** A chatbot gives you an answer in a conversation that disappears. DocuGen produces permanent, stored, structured documents — the same way a human analyst would write and file a security report. That is what makes it usable in a professional compliance context. Simply put: companies are legally required to prove they monitor their systems. DocuGen automatically creates that proof.
 
 ### Who Uses This
 
