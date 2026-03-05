@@ -752,24 +752,109 @@ Agent 4 picks up from here.
 **Input**: Filtered events, relevant categories, retry count
 **Output**: `state["retrieved_docs"]`, `state["retrieval_confidence"]`
 
-**The Retrieval Query Construction**:
-Rather than embedding the raw user question, the agent constructs a purpose-built retrieval query tailored to the event categories. This is more precise because the user's question ("What IAM changes happened yesterday?") is optimized for human communication, not semantic vector matching. A purpose-built query ("IAM users roles policies best practices least privilege credentials") is optimized for matching documentation content.
+---
 
-**Retry Strategy — Progressively Broadening Queries**:
+**One job**: Search the AWS documentation stored in Pinecone and find the chunks most relevant to what happened in the logs.
 
-| Attempt | Query Strategy | Example |
-|---|---|---|
-| 0 (first) | Category-specific technical terms | `"IAM users roles policies best practices least privilege credentials"` |
-| 1 (second) | Broader AWS security context | `"AWS security best practices shared responsibility model monitoring access control"` |
-| 2 (third) | Broadest possible | `"AWS cloud security IAM identity access management incident response compliance"` |
+---
 
-**Confidence Calculation**: After retrieving the top 5 Pinecone results, confidence is computed as the arithmetic mean of their cosine similarity scores:
+**Why is this needed?**
+
+At this point we have filtered events — for example 38 IAM_CHANGE events. Before Claude writes the report, we want to give it relevant AWS documentation to ground its recommendations. Without this, Claude writes from memory — which could be outdated or hallucinated. Agent 4 searches Pinecone and retrieves the actual documentation chunks most relevant to the events found.
+
+---
+
+**Why not just search using the user's question?**
+
+The user asked: *"What IAM changes happened yesterday?"*
+
+That question is written for a human — it's about time and event type. If you embed that sentence and search Pinecone with it, you might get documentation about CloudTrail time ranges or query syntax — not IAM best practices.
+
+Instead the agent builds a purpose-built retrieval query using the category Agent 3 identified:
+
+> *"IAM users roles policies best practices least privilege credentials"*
+
+This is optimized to match IAM documentation content — exactly what Claude needs to write meaningful security recommendations.
+
+---
+
+**How the search works**
+
+1. The retrieval query gets converted into a 1024-dimensional vector by Titan Embeddings
+2. That vector gets sent to Pinecone
+3. Pinecone finds the 5 most similar documentation chunks by cosine similarity
+4. Returns them with their similarity scores
+
+For example:
+```
+{source: "iam-best-practices.md",       similarity: 0.82}
+{source: "iam-users-guide.md",          similarity: 0.79}
+{source: "iam-policies-guide.md",       similarity: 0.71}
+{source: "iam-roles-guide.md",          similarity: 0.68}
+{source: "aws-security-fundamentals.md",similarity: 0.61}
+```
+
+---
+
+**The Confidence Score**
+
+After getting the 5 results, the agent calculates a confidence score:
 
 ```
-confidence = (sim_1 + sim_2 + sim_3 + sim_4 + sim_5) / 5
+confidence = (0.82 + 0.79 + 0.71 + 0.68 + 0.61) / 5 = 0.722
 ```
 
-This is deliberate — averaging forces all 5 results to be relevant, not just the top 1. A single excellent match surrounded by poor matches would not meet the threshold, correctly triggering a retry.
+This answers: *how relevant is the documentation I just retrieved?*
+
+- High score → found genuinely relevant docs → report will be well grounded
+- Low score → found only vaguely related docs → report recommendations may be weak
+
+**Why average all 5 and not just take the top 1?**
+Because one excellent match surrounded by 4 poor matches is not good enough. Averaging forces all 5 results to be relevant — if the average is low, the retrieval genuinely failed and a retry makes sense.
+
+---
+
+**The Retry Loop — How Queries Broaden**
+
+If confidence is below 0.50, instead of giving up the agent swaps to a pre-written broader query and tries again. The three queries per category are hardcoded in the code:
+
+Each category has its own first query (specific to that category). Queries 2 and 3 are the same across all categories since by that point you are casting a wide net regardless:
+
+```
+Attempt 0 (category-specific, different per category):
+  IAM_CHANGE:        "IAM users roles policies best practices least privilege credentials"
+  AUTH_EVENT:        "AWS console login authentication MFA access keys session"
+  SECURITY_GROUP:    "EC2 security groups inbound outbound rules network access"
+  S3_CONFIG:         "S3 bucket policies access control public access encryption"
+  EC2_LIFECYCLE:     "EC2 instances launch terminate security key pairs"
+  CLOUDTRAIL_CONFIG: "CloudTrail logging monitoring trail configuration"
+
+Attempt 1 (same for ALL categories):
+  "AWS security best practices shared responsibility model monitoring access control"
+
+Attempt 2 (same for ALL categories):
+  "AWS cloud security IAM identity access management incident response compliance"
+```
+
+No AI is involved in this broadening — it is a simple lookup: attempt number → use this pre-written string. Fast, predictable, and free.
+
+After 3 attempts, if confidence is still low, the pipeline proceeds anyway — but tells Claude to include a disclaimer in the report saying the documentation grounding was limited. **The system never blocks or crashes — it always produces a report, but is transparent about its confidence.**
+
+---
+
+**Honest limitation of this approach**
+
+The hardcoded queries are static — they were written once and never change. They are based on the category label alone, not the actual events found. For example, if the events show a `CreateUser` action from a suspicious IP at 3 AM, the retrieval query is still the same generic `"IAM users roles policies best practices least privilege credentials"` — it ignores the specifics of what happened entirely.
+
+A smarter approach would be to generate the retrieval query dynamically by sending the actual events to Claude and asking it to write a search query tailored to what specifically occurred. This is noted in the Future Enhancements section.
+
+---
+
+**Output written to shared state:**
+- The 5 retrieved documentation chunks with their content and source filenames
+- The confidence score
+
+Agent 5 picks up from here.
 
 ---
 
@@ -1325,6 +1410,17 @@ Enrich the report with CVE or CWE references when CloudTrail events match known 
 ### Human Feedback Loop
 
 Add a thumbs up/down feedback button in the Streamlit UI. Store feedback alongside the report metadata in S3. Over time, analyze which queries produce low-rated reports (likely to correlate with low confidence scores or poor documentation coverage). Use this signal to prioritize documentation expansion and prompt improvement.
+
+### Dynamic Retrieval Query Generation
+
+Currently Agent 4 uses hardcoded pre-written queries per category — the query is always the same regardless of what the actual events contain. A significantly better approach would be to send the actual filtered events to Claude and ask it to generate a search query tailored to what specifically happened:
+
+> *"Based on these events — CreateUser at 3 AM from an unrecognized IP, followed immediately by AttachUserPolicy granting AdministratorAccess — write a search query to find the most relevant AWS security documentation."*
+
+Claude would produce something like:
+> *"AWS IAM privilege escalation AdministratorAccess unauthorized user creation least privilege suspicious activity"*
+
+This query would retrieve far more targeted documentation than the generic hardcoded string. The cost is one extra Claude call (~3–5 seconds) which is worth it because better first-attempt queries mean fewer retries — potentially saving API calls overall.
 
 ### CI/CD and Automated Testing
 
