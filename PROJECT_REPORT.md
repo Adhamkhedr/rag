@@ -864,27 +864,77 @@ Agent 5 picks up from here.
 **Input**: Query, time range, filtered events, summary, retrieved docs, confidence
 **Output**: `state["final_report"]` — complete Markdown report
 
-**Event Balancing Strategy**:
-To ensure the report covers all relevant event types proportionally, the agent groups events by category and takes up to 5 events per category. This prevents a report dominated by one category (e.g., 10 IAM events overshadowing 2 security group events) when the user asked about both.
+---
 
-**Low-Confidence Handling**:
-The confidence score is passed explicitly into the report generation prompt. Claude's instructions differ based on it:
-- **Confidence ≥ 0.50**: Write a confident report citing documentation sources. Do not include warnings.
-- **Confidence < 0.50**: Include a prominent disclaimer at the top: documentation grounding was limited; the timeline is factual but recommendations may be incomplete.
+**One job**: Take everything collected by the previous agents and write the final security report.
 
-This is a key design principle: *the system never lies about its reliability*. The report transparently communicates what it knows vs. what it inferred.
+---
 
-**Report Structure** (enforced via system prompt):
+**What it receives**
+
+By the time Agent 5 runs, the shared state contains:
+- The original user question
+- The time range analyzed
+- The filtered, simplified events (e.g. 38 IAM_CHANGE events)
+- The 2–3 sentence summary Agent 2 generated
+- The 5 documentation chunks retrieved from Pinecone
+- The confidence score
+
+---
+
+**Event Balancing**
+
+If multiple categories are relevant (e.g. both IAM_CHANGE and AUTH_EVENT), Agent 5 does not dump all events into the prompt. It groups events by category and takes up to 5 per category.
+
+Why? If you have 38 IAM events and 2 AUTH events, without balancing the report would be almost entirely about IAM and barely mention the auth events. Capping at 5 per category ensures every relevant type of activity gets covered proportionally in the report.
+
+---
+
+**What Claude gets in its prompt**
+
+Claude receives all of this together:
+1. The original question — so it knows what the user is actually asking
+2. The time range — for the "Time Range Analyzed" section
+3. The balanced events — the actual facts of what happened
+4. The event summary — a quick overview
+5. The first 500 characters of each retrieved documentation chunk — the grounding material
+6. The confidence score — so it knows whether to write confidently or include a disclaimer
+
+---
+
+**The Report Structure**
+
+Claude is told exactly what sections to write — the structure is enforced via the system prompt:
+
 ```
 # Incident Report
-## Executive Summary
-## Time Range Analyzed
-## Timeline of Events (table: Time | Event | User | Source IP | Category)
-## Detailed Findings (references AWS documentation)
-## Risk Assessment (Low / Medium / High with justification)
-## Recommended Actions (numbered list)
-## Grounding & Confidence (score + documentation sources cited)
+## Executive Summary          ← 2-3 sentence overview
+## Time Range Analyzed        ← start and end timestamps
+## Timeline of Events         ← table: Time | Event | User | Source IP | Category
+## Detailed Findings          ← analysis citing AWS documentation
+## Risk Assessment            ← Low / Medium / High with justification
+## Recommended Actions        ← numbered list of concrete steps
+## Grounding & Confidence     ← confidence score + documentation sources cited
 ```
+
+Why enforce the structure? Because if Claude is free to format however it wants, different queries produce inconsistently structured reports. Enforcing sections means every report looks the same — which matters for compliance and auditability.
+
+---
+
+**The Confidence-Based Disclaimer**
+
+The confidence score from Agent 4 directly changes what Claude is told to write:
+
+- **Score ≥ 0.50**: "Write a confident, authoritative report. Cite documentation sources. Do NOT include any warnings."
+- **Score < 0.50**: "Include a prominent WARNING at the top — documentation grounding was limited. The timeline is factual but recommendations may be incomplete."
+
+The system never pretends to be more reliable than it is. If the documentation retrieval was poor, the report says so explicitly. This is a key design principle — the system never lies about its own reliability.
+
+---
+
+**Output written to shared state**: The complete Markdown report as a string, plus a metadata object containing the report ID, confidence score, sources referenced, and event count.
+
+Agent 6 picks up from here.
 
 ---
 
