@@ -649,19 +649,100 @@ Agent 3 picks up from here.
 **Input**: `state["query"]`, `state["log_findings"]["events"]`
 **Output**: `state["relevant_categories"]` — list of category names
 
-**Purpose**: Not every category of events is relevant to every question. If the user asks *"What security group changes happened today?"*, sending IAM events, S3 events, and EC2 lifecycle events to the retrieval and report steps is noise that reduces focus and wastes tokens.
+---
 
-**How it works**: Claude is given the user's question and the list of categories found in the events. It returns a comma-separated list of relevant categories. A fail-safe handles the edge case where Claude returns nothing: all categories are kept.
+**One job**: Look at all the events Agent 2 found and decide which categories are actually relevant to what the user asked.
 
-**Design Choices Considered**:
+---
 
-| Option | Mechanism | Chosen? |
-|---|---|---|
-| A: Send everything | No filtering | No — unfocused RAG, wastes tokens |
-| B: LLM filter | Claude decides relevance | **Yes** — most precise |
-| C: Query-biased ranking | Adjust Pinecone scores | No — biases but doesn't exclude |
+**Why is this needed?**
 
-Option B was chosen for precision. The cost is ~100 tokens and ~2–3 seconds — acceptable for the quality gain. For a broad question ("What happened today?"), Claude correctly returns all categories.
+After Agent 2 runs, we have events from multiple categories — for example:
+- 38 IAM_CHANGE events
+- 12 AUTH_EVENT events
+- 5 SECURITY_GROUP events
+- 3 S3_CONFIG events
+
+But the user asked: *"What IAM changes happened yesterday?"*
+
+The AUTH_EVENT, SECURITY_GROUP, and S3_CONFIG events have nothing to do with that question. If we send all of them to the next steps, two things go wrong:
+
+1. **The RAG retrieval gets confused** — it searches for documentation matching IAM AND security groups AND S3 all at once, retrieving a scattered mix of unrelated docs instead of focused IAM documentation
+2. **The report loses focus** — Claude tries to write about everything instead of directly answering the user's question
+
+---
+
+**How it works**
+
+Claude is given two things:
+1. The user's original question
+2. The list of categories found in the events
+
+It returns only the category names that are relevant:
+
+> *"IAM_CHANGE"*
+
+The code then filters the events list to only IAM_CHANGE events. The rest are set aside for the remainder of the pipeline.
+
+**What about broad questions?**
+If the user asks *"What happened today?"* or *"Give me a full security audit"*, Claude correctly returns all categories — nothing gets filtered out.
+
+**What if Claude returns nothing?**
+There is a fail-safe — if Claude's response is empty or unreadable, the code defaults to keeping all categories. The pipeline never gets blocked by a bad Claude response here.
+
+---
+
+**Why Claude for this and not code?**
+
+You cannot hardcode this decision. *"What IAM changes happened?"* is obviously IAM only. But *"Were there any suspicious logins or permission changes?"* covers both AUTH_EVENT and IAM_CHANGE. Only Claude can read the question and make that judgment call correctly.
+
+---
+
+**Three approaches were considered:**
+
+**Option A — Send everything, no filtering**
+Skip Agent 3 entirely. Send all events from all categories directly to retrieval.
+The problem: the retrieval query becomes vague, Pinecone returns a scattered mix of docs, and the report loses focus trying to cover everything.
+
+**Option B — Claude decides (what we do)**
+Ask Claude which categories are relevant. Filter events before anything else happens. Only relevant events move forward.
+Most precise — the retrieval query is focused, the docs retrieved are targeted, the report answers the actual question.
+
+**Option C — Query-biased ranking**
+Don't filter anything out, but when searching Pinecone adjust the ranking so results closer to the user's question score higher.
+The problem: it reorders results but doesn't remove irrelevant events. IAM, security group, and S3 events all still go into the prompt — just slightly reordered. The noise is still there.
+
+Option B was chosen because it actually removes irrelevant events before they touch anything downstream, rather than just reordering or tolerating them. The cost is small — about 100 tokens and 2–3 seconds — which is worth the precision gain.
+
+---
+
+**The category is the bridge between the question and everything downstream**
+
+Once Agent 3 identifies the relevant category, it drives everything that follows:
+
+```
+User question: "What IAM changes happened?"
+        ↓
+Agent 3: relevant category = IAM_CHANGE
+        ↓
+Agent 4: builds IAM-specific retrieval query → retrieves IAM documentation
+        ↓
+Agent 5: writes report using only IAM events + IAM documentation
+```
+
+Importantly, the original question is never discarded — it travels in the shared state the entire time and gets included in Agent 5's prompt directly. So Claude always sees three things when writing the report:
+
+- The original question — what the user wants to know
+- The filtered events — what actually happened that is relevant
+- The retrieved documentation — why it matters and what to do about it
+
+The filtering didn't replace the question. It removed the noise around it so Claude can answer it more precisely.
+
+---
+
+**Output written to shared state**: A list of relevant category names, e.g. `["IAM_CHANGE"]`
+
+Agent 4 picks up from here.
 
 ---
 
