@@ -944,28 +944,67 @@ Agent 6 picks up from here.
 **Input**: Final report Markdown, metadata
 **Output**: S3 upload confirmation
 
-Two files are written to S3 per report:
-```
-s3://docugen-reports-{account_id}/reports/YYYY-MM-DD/{report_id}-report.md
-s3://docugen-reports-{account_id}/reports/YYYY-MM-DD/{report_id}-metadata.json
-```
+---
 
-The metadata JSON contains:
+**One job**: Save the generated report permanently to S3 so it can be used as audit evidence.
+
+---
+
+**Why is this needed?**
+
+If the report only existed in memory, it would disappear the moment the pipeline finishes. There would be no permanent record — nothing to show an auditor, nothing to search through later, nothing traceable. Agent 6 makes the report permanent.
+
+---
+
+**What it saves**
+
+Two files get written to S3 for every report:
+
+**File 1 — The report itself:**
+```
+s3://docugen-reports-523761210523/reports/2026-02-07/a1b2c3d4-report.md
+```
+A Markdown file — this is what the security analyst reads.
+
+**File 2 — The metadata:**
+```
+s3://docugen-reports-523761210523/reports/2026-02-07/a1b2c3d4-metadata.json
+```
 ```json
 {
   "report_id": "a1b2c3d4",
   "query": "What IAM changes happened yesterday?",
-  "time_range": {"start": "...", "end": "..."},
+  "time_range": {"start": "2026-02-07T00:00:00Z", "end": "2026-02-07T23:59:59Z"},
   "generated_at": "2026-02-08T15:30:00Z",
-  "model_used": "us.anthropic.claude-3-5-sonnet-20241022-v2:0",
+  "model_used": "Claude 3.5 Sonnet",
   "retrieval_confidence": 0.72,
   "sources_referenced": ["iam-users-guide.md", "iam-best-practices.md"],
   "event_count": 42
 }
 ```
 
-**Why store both report and metadata separately?**
-The Markdown file is for human consumption — security analysts read it. The JSON metadata file is for programmatic consumption — audit systems can query it, dashboards can aggregate confidence scores over time, and compliance tools can verify that specific documentation was referenced in each report.
+**Why two separate files?**
+The Markdown file is for **humans** — security analysts open it and read it. The JSON metadata file is for **machines** — audit systems can query it programmatically, dashboards can aggregate confidence scores over time, and compliance tools can verify that specific documentation was referenced. You can scan hundreds of metadata files quickly without opening a single report.
+
+**Why organize by date?**
+Organizing by date makes it easy to find all reports for a specific day, archive old reports, and satisfy compliance requirements like "show me all security monitoring reports from last month."
+
+**Why a random 8-character report ID?**
+Each report gets a unique ID generated from a UUID. This means multiple reports on the same day never overwrite each other, every report is uniquely identifiable, and the ID links the report file and metadata file together.
+
+---
+
+**Does this actually need to be a separate agent?**
+
+Honestly — not strictly. Storing the report is just two S3 function calls with no reasoning or AI involved. It could have been done at the end of Agent 5 in the same function.
+
+The reason it is a separate agent is separation of concerns — Agent 5 generates the report, Agent 6 stores it. If storing fails, you know exactly where it failed. If you later want to change where reports are stored (different bucket, different format, add a database record alongside), you change Agent 6 only without touching the report generation logic. It also makes testing cleaner — report generation and report storage can be tested independently with separate mocks.
+
+That said, combining them into one node would have worked fine too. The separation is a design preference, not a strict necessity.
+
+---
+
+**Output**: Nothing written to shared state — this is the final step. The pipeline ends here and the Streamlit UI displays the report to the user.
 
 ---
 
