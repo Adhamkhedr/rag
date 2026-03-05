@@ -401,14 +401,55 @@ This means the system "warms up" once and is fast forever after.
 **Input**: `state["query"]` — the raw user question
 **Output**: `state["time_range"]` — `{"start": "YYYY-MM-DDT00:00:00Z", "end": "YYYY-MM-DDT23:59:59Z"}`
 
-**The Problem**: CloudTrail logs are organized by date in S3 (`YYYY/MM/DD/` prefix structure). To know which files to download, the pipeline must convert a human phrase like "yesterday" into precise ISO-8601 timestamps before any S3 calls are made.
+---
 
-**The Solution**: Claude is given the exact current UTC time and asked to parse the time expression. Temperature is set to 0.0 — this task is deterministic, not creative. Max tokens is set to 200 — the response is a small JSON object, never a long text.
+**One job**: Convert the user's plain English time expression into exact timestamps.
 
-**Why inject current UTC time into the prompt?**
-Relative expressions like "yesterday," "last Tuesday," or "this morning" have no meaning without a reference point. Without the current time, Claude would either hallucinate a date or refuse to answer. The prompt injects `datetime.now(timezone.utc).isoformat()` at call time so every invocation has a precise anchor.
+---
 
-**Handling LLM quirks**: Claude occasionally wraps JSON responses in markdown code fences (` ```json ... ``` `). The agent strips these before parsing, making it robust to minor formatting variations.
+**Why is this needed?**
+
+CloudTrail logs are stored in S3 organized by date in the folder path itself:
+```
+AWSLogs/
+  523761210523/
+    CloudTrail/
+      us-east-1/
+        2026/
+          02/
+            07/   ← all Feb 7 logs live here
+            08/   ← all Feb 8 logs live here
+```
+
+To know which folder to look in, the system needs exact dates and times. But users type things like "yesterday", "last night", "this morning", or "last Tuesday." A computer cannot work with those expressions — it needs `2026-02-07T00:00:00Z` to `2026-02-07T23:59:59Z`.
+
+---
+
+**How it works**
+
+1. The code checks the actual current UTC time using Python's `datetime.now()` — for example `2026-02-08T12:00:00Z`
+2. It sends that current time to Claude along with the user's question:
+   > *"Today is 2026-02-08T12:00:00Z. The user asked: 'What IAM changes happened yesterday?' — what is the time range they mean?"*
+3. Claude interprets the expression and returns a JSON object:
+```json
+{"start": "2026-02-07T00:00:00Z", "end": "2026-02-07T23:59:59Z"}
+```
+4. That gets written to shared state and Agent 2 picks it up
+
+**Why inject the current time into the prompt?**
+Claude by itself has no access to a clock. Without being told what today's date is, it cannot interpret relative expressions like "yesterday" or "last Tuesday." Injecting the current UTC time gives Claude a reference point so it can calculate the correct dates every time.
+
+**Why JSON output?**
+The output needs to be machine-readable so the next agent can use it directly in code. Claude is explicitly instructed in the prompt to return only a JSON object — no explanation, no extra text. Temperature is set to 0.0 (fully deterministic) since this is a precise calculation, not a creative task. Max tokens is set to 200 since the response is always a small JSON object.
+
+**Why Claude and not just code?**
+You could hardcode "yesterday = today minus 1 day" — but what about "last Tuesday afternoon"? Or "the past 3 hours"? Or "this morning"? These expressions are too varied to handle with simple if/else logic. Claude handles all of them naturally.
+
+**Handling LLM quirks**: Claude occasionally wraps JSON responses in markdown code fences (` ```json ... ``` `). The agent detects and strips these before parsing, making it robust to minor formatting variations.
+
+**Output written to shared state**: `{"start": "2026-02-07T00:00:00Z", "end": "2026-02-07T23:59:59Z"}`
+
+Agent 2 picks up from here.
 
 ---
 
@@ -418,22 +459,143 @@ Relative expressions like "yesterday," "last Tuesday," or "this morning" have no
 **Input**: `state["time_range"]`
 **Output**: `state["log_findings"]` — `{events: [...], summary: "..."}`
 
-This is the most computationally intensive agent. It performs seven sequential phases:
+---
 
-**Phase 1: Build S3 paths**
-Converts ISO-8601 timestamps to a list of calendar dates (handling multi-day ranges). For each date, builds the S3 prefix: `AWSLogs/{account_id}/CloudTrail/{region}/YYYY/MM/DD/`.
+**One job**: Get the CloudTrail logs for the time range Agent 1 found, and turn them into clean, useful events.
 
-**Phase 2: List files**
-Uses an S3 paginator (not a simple list call) because a busy account can generate >1000 log files per day, exceeding the 1000-item S3 list limit. A paginator automatically handles continuation tokens. Files are pre-filtered at this stage by parsing timestamps from filenames using a regex (`T\d{4}Z` pattern) — files clearly outside the time range are never downloaded.
+---
 
-**Phase 3: Download and decompress**
-CloudTrail logs are stored as `.json.gz` (gzip-compressed JSON). Each file is downloaded from S3 and decompressed in memory. The resulting JSON contains a `Records` array of raw events.
+**Phase 1: Find the Right Folders**
 
-**Phase 4: Exact timestamp filtering**
-File-level filtering is approximate (CloudTrail files often contain a few hours of events, and file timestamps are not event timestamps). This phase re-filters at the individual event level, keeping only events whose `eventTime` falls within the requested range.
+Agent 1 gave us a time range, for example:
+```
+start: 2026-02-07T00:00:00Z
+end:   2026-02-07T23:59:59Z
+```
 
-**Phase 5: Simplify and categorize**
-Reduces each CloudTrail event from 50+ fields to 7. Categorization is done by **dictionary lookup** (not LLM) — the mapping from event names to categories is fixed and well-defined:
+S3 stores CloudTrail logs in folders organized by date:
+```
+AWSLogs/
+  523761210523/
+    CloudTrail/
+      us-east-1/
+        2026/
+          02/
+            07/  ← this is where Feb 7 logs live
+```
+
+The code takes the dates from the time range and constructs the folder address for each date. If the range spans multiple days it does this for every day, building one folder path per day.
+
+---
+
+**Phase 2: List the Files, Filter by Filename**
+
+Inside the Feb 7 folder there are many compressed files. Each filename contains a rough timestamp:
+```
+523761210523_CloudTrail_us-east-1_20260207T0100Z_abc.json.gz  ← created ~1 AM
+523761210523_CloudTrail_us-east-1_20260207T0600Z_def.json.gz  ← created ~6 AM
+523761210523_CloudTrail_us-east-1_20260207T1400Z_xyz.json.gz  ← created ~2 PM
+```
+
+The code uses regex to extract the timestamp from each filename (`T0100Z`, `T0600Z`, etc.) and skips files that are clearly outside the time range the user asked for. For example if the user asked for "this morning" (00:00 to 12:00), the file with `T1400Z` gets skipped entirely — never downloaded.
+
+This matters because a busy AWS account can have hundreds of files per day. Skipping irrelevant ones saves time and bandwidth.
+
+A paginator is used instead of a simple S3 list call because S3 list calls return a maximum of 1000 items at a time. A busy account can have more than 1000 files in a single day — the paginator automatically handles fetching the next batch until all files are listed.
+
+---
+
+**Phase 3: Download and Decompress**
+
+For each file that passed the filename filter, the code:
+1. Downloads the `.json.gz` file from S3
+2. Decompresses it (CloudTrail saves all logs as gzip-compressed files to save storage space)
+3. Parses the JSON inside
+
+Each file now gives us a list of raw CloudTrail events — each one with 50+ fields.
+
+---
+
+**Phase 4: Exact Timestamp Filtering**
+
+The filename timestamp is just when CloudTrail created the file — not the exact timestamps of the events inside it. A file named `T1200Z` might contain events from 11:50 AM and 12:10 PM mixed together because CloudTrail batches events and saves them every few minutes regardless of exact event times.
+
+So the code opens every event, reads its individual `eventTime` field, and asks: is this event actually within the time range the user asked for?
+
+- Event at 11:50 AM → keep it ✓
+- Event at 12:10 PM → discard it ✗
+
+**Two levels of filtering, each more precise than the last:**
+```
+Folders  →  filter by date             (eliminates wrong days)
+  ↓
+Files    →  filter by filename time    (eliminates obvious misses, saves bandwidth)
+  ↓
+Events   →  filter by exact timestamp  (eliminates edge cases at boundaries)
+```
+
+---
+
+**Phase 5: Simplify and Categorize**
+
+Each raw CloudTrail event has 50+ fields. Here is what one event actually looks like before simplification:
+
+```json
+{
+    "eventVersion": "1.08",
+    "userIdentity": {
+        "type": "IAMUser",
+        "principalId": "AIDAXT4UZ2SNQDEFXIL4",
+        "arn": "arn:aws:iam::523761210523:user/docugen-dev",
+        "accountId": "523761210523",
+        "accessKeyId": "AKIAXT4UZ2SNQDEFXIL4",
+        "userName": "docugen-dev"
+    },
+    "eventTime": "2026-02-07T14:23:00Z",
+    "eventSource": "iam.amazonaws.com",
+    "eventName": "CreateUser",
+    "awsRegion": "us-east-1",
+    "sourceIPAddress": "203.0.113.50",
+    "requestParameters": {"userName": "test-user"},
+    "responseElements": {"user": {...}},
+    "requestID": "abc123-def456",
+    "eventID": "xyz789",
+    "tlsDetails": {"tlsVersion": "TLSv1.2", ...},
+    ... 30+ more fields
+}
+```
+
+After simplification:
+```json
+{
+    "eventTime":      "2026-02-07T14:23:00Z",
+    "eventName":      "CreateUser",
+    "userName":       "docugen-dev",
+    "sourceIP":       "203.0.113.50",
+    "region":         "us-east-1",
+    "category":       "IAM_CHANGE",
+    "targetResource": "test-user"
+}
+```
+
+**Why these 7 fields specifically?** They are exactly what Claude needs to write a security report:
+
+| Field | Why Claude Needs It |
+|---|---|
+| `eventTime` | To build the timeline table |
+| `eventName` | To describe what action was performed |
+| `userName` | To identify who did it |
+| `sourceIP` | An unusual IP is a red flag |
+| `region` | Activity in unexpected regions is suspicious |
+| `category` | To organize the report by type of activity |
+| `targetResource` | To describe what was acted upon (e.g. name of new user) |
+
+Everything else — `tlsDetails`, `requestID`, `principalId`, `eventVersion`, `eventSource` — is AWS internal metadata that adds zero value to a security report.
+
+**Why reduce the fields at all?**
+Two reasons. First, token cost — when we later send events to Claude, every field costs tokens. Sending 50 events with 50+ fields each is thousands of tokens of irrelevant noise. Second, LLM focus — the more noise in the prompt, the more likely Claude misses something important. Clean input produces better output.
+
+**Categorization is done by dictionary lookup — not AI:**
 
 | Category | Example Events |
 |---|---|
@@ -445,14 +607,39 @@ Reduces each CloudTrail event from 50+ fields to 7. Categorization is done by **
 | `CLOUDTRAIL_CONFIG` | CreateTrail, StopLogging, DeleteTrail |
 | `OTHER` | Anything not in the above lists |
 
-**Why deterministic categorization instead of LLM?**
-The mapping is exhaustive and well-defined. There is no ambiguity — `CreateUser` is always an IAM change. Using an LLM here would add 2–3 seconds of latency and introduce the possibility of misclassification. Deterministic code is faster, cheaper, and more reliable for a finite, well-understood problem.
+**Why dictionary lookup and not Claude?**
+The mapping is completely fixed and finite — `CreateUser` will always be an IAM change, no ambiguity. Using Claude here would add 2–3 seconds of latency per run and introduce a small chance of misclassification. Deterministic code is faster, cheaper, and 100% reliable for a well-defined mapping. The one weakness is that if AWS introduces a new event type tomorrow, it silently falls into "OTHER" — in production you would want an alert when "OTHER" events spike.
 
-**Phase 6: Noise separation**
-On a typical AWS account, ~95% of CloudTrail events are routine service-to-service calls: `GetBucketAcl`, `ListBuckets`, `GenerateDataKey`, `HeadBucket`, `LookupEvents`, etc. These are not deleted — they are moved to the end of the events list. A typical day: ~20–50 security-relevant events + ~800+ noise events. The report focuses on the relevant events; the noise is preserved for full audit trail completeness.
+---
 
-**Phase 7: Generate summary**
-Sends up to 50 security-relevant events to Claude with a request for a 2–3 sentence summary. This summary accompanies the full event list throughout the rest of the pipeline, giving subsequent agents a quick overview without re-reading all events.
+**Phase 6: Separate Noise**
+
+On a typical AWS account, around 95% of CloudTrail events are routine background calls that AWS services make automatically — things like `GetBucketAcl`, `ListBuckets`, `HeadBucket`, `GenerateDataKey`. These are not security-relevant at all.
+
+The code separates these noise events from the security-relevant ones. They are not deleted — just moved to the end of the list so they do not dominate the analysis. A typical day looks like:
+
+- ~20–50 security-relevant events
+- ~800+ noise events
+
+The noise is preserved for full audit trail completeness but does not appear prominently in the report.
+
+---
+
+**Phase 7: Generate a Summary**
+
+The code sends up to 50 of the security-relevant events to Claude and asks for a 2–3 sentence plain English summary. Something like:
+
+> *"3 IAM users were created and 1 security group rule was modified. All actions were performed by docugen-dev from IP 203.0.113.50. No suspicious patterns detected."*
+
+This summary travels with the events through the rest of the pipeline so subsequent agents have a quick overview without re-reading all events.
+
+---
+
+**Output written to shared state:**
+- A clean list of simplified, categorized events
+- The Claude-generated summary
+
+Agent 3 picks up from here.
 
 ---
 
