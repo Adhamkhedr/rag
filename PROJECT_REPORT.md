@@ -1332,6 +1332,112 @@ Total time: ~35–45 seconds
 
 ---
 
+### Example 2: Suspicious Login Detection
+
+**User asks:** *"Were there any suspicious logins yesterday?"*
+
+**Agent 1 — Time Parsing**
+- Current UTC: 2026-03-06T10:00:00Z
+- Claude interprets "yesterday" → full day March 5
+- Output: `{"start": "2026-03-05T00:00:00Z", "end": "2026-03-05T23:59:59Z"}`
+
+**Agent 2 — Log Analysis**
+- Builds S3 prefix: `AWSLogs/.../2026/03/05/`
+- Downloads and decompresses 4 `.json.gz` files
+- Parses 1,200 raw CloudTrail events
+- Filters to events within exact timestamp range: 1,180 events
+- Reduces each to 7 fields, categorizes via dictionary lookup:
+  - 5 AUTH_EVENT
+  - 3 IAM_CHANGE
+  - 1,172 noise (routine S3 reads, describe calls, etc.)
+- Sends the 8 relevant events to Claude for summary
+- Claude summary: *"5 authentication events detected, 3 from unusual IPs. 2 failed login attempts followed by a successful login from IP 185.220.101.45"*
+- Output: `LogFindings{events: [8 events], summary: "..."}`
+
+**Agent 3 — Event Filter**
+- User question: *"Were there any suspicious logins yesterday?"*
+- Categories found in logs: `[AUTH_EVENT, IAM_CHANGE]`
+- Claude looks at the question and returns: `"AUTH_EVENT"`
+- Filters to AUTH_EVENT only: 5 events
+- Output: `relevant_categories = ["AUTH_EVENT"]`
+
+**Agent 4 — Retrieval**
+- Looks at category `AUTH_EVENT` + summary mentioning unusual IPs and failed logins
+- Builds refined query string: `"AWS console login authentication failed attempts unusual IP suspicious activity MFA root account security"`
+- Titan V2 embeds this → 1024-dim vector
+- Pinecone searches against all stored AWS doc chunks
+- Top 5 results:
+```
+{source: "aws-security-fundamentals.md",  similarity: 0.85}
+{source: "iam-best-practices.md",         similarity: 0.81}
+{source: "cloudtrail-overview.md",        similarity: 0.76}
+{source: "guardduty-findings-guide.md",   similarity: 0.72}
+{source: "iam-users-guide.md",            similarity: 0.65}
+```
+- Confidence = (0.85+0.81+0.76+0.72+0.65)/5 = 0.758
+- 0.758 ≥ 0.50 → sufficient → proceed
+- Output: 5 doc chunks + confidence 0.758
+
+**Agent 5 — Report Synthesis**
+
+Claude receives the original query, time range, 5 AUTH_EVENT events, the summary, and 5 AWS doc chunks about authentication security, then writes:
+
+```markdown
+# Security Incident Report — March 5, 2026
+
+## Executive Summary
+5 authentication events detected on March 5. 2 failed login attempts followed
+by a successful login from IP 185.220.101.45, a known Tor exit node. This
+pattern indicates a potential brute-force attack resulting in unauthorized access.
+
+## Event Timeline
+| Time        | User  | Event        | IP              | Result  |
+|-------------|-------|--------------|-----------------|---------|
+| 02:14:33 AM | john  | ConsoleLogin | 185.220.101.45  | Failure |
+| 02:14:51 AM | john  | ConsoleLogin | 185.220.101.45  | Failure |
+| 02:15:09 AM | john  | ConsoleLogin | 185.220.101.45  | Success |
+| 09:30:00 AM | alice | ConsoleLogin | 192.168.1.1     | Success |
+| 03:45:00 PM | admin | ConsoleLogin | 10.0.0.5        | Success |
+
+## Findings
+Two consecutive failed logins followed by success from the same IP suggests
+credential stuffing or brute force. Per aws-security-fundamentals.md:
+"Repeated failed authentication from a single IP is a strong indicator of
+automated attack."
+
+## Risk Assessment: HIGH
+
+## Recommended Actions
+1. Immediately revoke john's active sessions
+2. Force password reset for john
+3. Enable MFA on all IAM users (iam-best-practices.md)
+4. Add IP 185.220.101.45 to deny list
+5. Enable GuardDuty for automated threat detection
+
+## Documentation Sources
+- aws-security-fundamentals.md (similarity: 0.85)
+- iam-best-practices.md (similarity: 0.81)
+- cloudtrail-overview.md (similarity: 0.76)
+
+Confidence Score: 0.758
+```
+
+**Agent 6 — Store Report**
+- Generates report ID: `f7e3a291`
+- Saves to S3:
+  - `reports/2026-03-05/f7e3a291-report.md`
+  - `reports/2026-03-05/f7e3a291-metadata.json`
+
+**Streamlit UI displays:**
+- Full rendered report with event timeline table
+- Green confidence indicator (0.758 ≥ 0.50)
+- Download button
+- Metadata: time range, 5 events analyzed, S3 location
+
+Total time: ~35–45 seconds
+
+---
+
 ## 15. AWS Infrastructure
 
 ### AWS CloudTrail
